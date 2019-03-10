@@ -1,0 +1,955 @@
+---
+output:
+  knitrBootstrap::bootstrap_document:
+    title: "predicting landing overruns"
+    theme: united
+    highlight: HighlightJs
+    theme.chooser: FALSE
+    highlight.chooser: FALSE
+---
+<h1>predicting landing overruns</h1>
+<h3>harish m</h3>
+
+# introduction  
+The goal of this analysis is to study the impact of factors that could be causing landing overruns. 950 rows of data with flight information of two different aircrafts is examined, and filtered based on the conditions in the variable dictionary. The data is simulated for the purpose of statistical modeling.
+<br><br>
+```{r message=FALSE, warning=FALSE}
+library(knitr)
+library(knitrBootstrap)
+library(DT)
+library(tidyverse)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(MASS)
+library(pROC)
+library(ROCR)
+library(boot)
+library(nnet)
+remove(list = ls())
+
+# Globally controlling code blocks
+opts_chunk$set(message = FALSE, # prevent messages 
+               warning = FALSE, # prevent warnings
+               fig.align = "center", # graph position
+               fig.height = 3, # graph default height and width
+               fig.width = 6)
+```
+# variable descriptions
+```{r}
+variables <- c("aircraft", "duration", "no_pasg", "speed_ground", 
+               "speed_air", "height", "pitch", "distance")
+
+descriptions <- c("the make of an aircraft (Boeing or Airbus)",
+                  "duration in minutes - should always be greater than 40min",
+                  "number of passengers in the flight",
+                  "the ground speed of an aircraft when passing over the threshold of the runway.if its value is less than 30MPH or greater than 140MPH, then the landing would be                 considered as abnormal",
+                  "the air speed of the aircraft, follows the same restrictions",
+                  "The height of an aircraft when it is passing over the threshold of the runway. The landing aircraft is required to be at least 6 meters high at the threshold of the runway",
+                  "Pitch angle of an aircraft when it is passing over the threshold of the runway",
+                  "The landing distance of an aircraft. More specifically, it refers to the distance between the threshold of the runway and the point where the aircraft can be fully stopped. The length of the airport runway is typically less than 6000 feet")
+
+data.frame("Variable" = variables, "Description" = descriptions) %>% kable()
+
+```
+
+# data importing  
+Starting off, the data from the two excel files is imported and it is observed that file one has eight columns against the seven of the second file.
+<br><br>
+```{r}
+file1 <- read_excel("FAA1.xls")
+file2 <- read_excel("FAA2.xls")
+
+file1_vars <- file1 %>% colnames() %>% as.data.frame()
+colnames(file1_vars) <- "File 1"
+
+file2_vars <- file2 %>% colnames()
+file2_vars <- c(file2_vars[1], NA, file2_vars[2:7]) %>% as_data_frame()
+colnames(file2_vars) <- "File 2"
+
+bind_cols(file1_vars, file2_vars) %>% kable(caption = "Variables in two files")
+```
+We <b>do not have `duration` variable</b> in the second file.
+<br><br>
+
+There are `r dim(file1)[1]` records in the first file and `r dim(file2)[1]` in the second. They are combined together and to give the user an idea of the data, the top 5 rows are printed below.
+<br><br>
+```{r}
+file2$duration <- NA
+data <- bind_rows(file1, file2)
+data %>% head(5) %>% kable(caption = "Raw data form the two files")
+```
+
+Ignoring the duration variable, it is observed that there are <b> `r length(which(duplicated(data[,-2]) == TRUE))` duplicate entries </b>. These entries are dropped from the dataset. The final data to be used for analysis, at this point, contains <b>`r dim(data)[1]` records and `r dim(data)[2]` variables</b>. A summary of each variable is presented below.
+<br><br>
+```{r}
+data <- data[-(which(duplicated(data[,-2]) == TRUE)), ]
+summary(data[,-1]) %>% as.data.frame() %>% 
+  separate(Freq, into = c("stat", "value"), sep = ":" ) %>% 
+  spread(key = stat, value = value) %>% 
+  dplyr::select(2:9) %>% rename("Variable" = "Var2") %>%
+  kable(caption = "Summary statistics of each variable")
+```
+## what we know so far
+
+<ul>
+<li>Landing information of two flights - `Boeing` and `Airbus` </li>
+<li>The 950 records of data have been reduced to 850 after removing duplicates.</li>
+<li>8 variables are available for analysis.</li>
+<li>Two columns contain NA values - `duration = 50`, `speed_air = 642`
+</ul>
+<br><br>
+
+# data cleaning
+
+Going by the variable dictionary, there exist records with abonormal values.
+
+<ul>
+<li>`r data %>% filter(duration < 40) %>% count() %>% .[[1]]` records where duration is less than 40 minutes </li>
+<li>`r data %>% filter(height < 0) %>% count() %>% .[[1]]` records with negative height</li>
+</ul>
+```{r}
+abnormal_data <- data %>% filter(duration < 40) 
+abnormal_data <- bind_rows(abnormal_data, data %>% filter(height < 0))
+
+data <- data %>% setdiff(abnormal_data)
+```
+<br><br>
+They are removed from the dataset, leaving us with 850 observations and the same 8 variables. The summary stats, along with the histograms for the distributions are presented below.
+<br><br>
+```{r}
+summary(data[,-1]) %>% as.data.frame() %>% 
+  separate(Freq, into = c("stat", "value"), sep = ":" ) %>% 
+  spread(key = stat, value = value) %>% 
+  dplyr::select(2:9) %>% rename("Variable" = "Var2") %>% 
+  kable(caption = "Summary statistics after removing abnormal values")
+```
+
+```{r fig.height = 6, fig.width = 12}
+histo_viz <- list()
+for (i in variables) {
+  if (i == "aircraft") {
+    histo_viz[[i]] <- data %>% ggplot(aes_string(i)) + geom_bar()
+  }
+  else {
+    histo_viz[[i]] <- data %>% ggplot(aes_string(i)) + geom_histogram()
+  }
+}
+
+grid.arrange(histo_viz[[1]], histo_viz[[2]], histo_viz[[3]], histo_viz[[4]],
+             histo_viz[[5]], histo_viz[[6]], histo_viz[[7]], histo_viz[[8]],
+             nrow = 2, ncol = 4, top = "Histograms to visualize the data ranges" )
+```
+
+## what we know so far
+
+<ul>
+<li>Landing information of two flights - `Boeing` and `Airbus` </li>
+<li>The 850 records of data have been reduced to 840 after removing abnormal data</li>
+<li>8 variables are available for analysis.</li>
+<li>Two columns contain NA values - `duration = 50`, `speed_air = 642`
+</ul>
+
+# univariate analysis
+
+## pairwise correlation
+
+To understand how each of the variables correspond to the landing-distance, pairwise correlation is being computed. Looking at the table, except for variables `speed_ground` and `speed_air`, all values are too small to be actually causing a correlation to landing distance. But the p-values indicate that `speed_air`, `speed_ground`, `aircraft_bool`, `height` and `pitch` variables have a significant effect.
+<br><br>
+```{r}
+data_with_bool <- data
+data_with_bool$aircraft_bool <- ifelse(data$aircraft == "airbus", 0, 1)
+data_with_bool2 <- data_with_bool
+
+corr_table <- expand.grid(variable = c(variables[-c(1,8)], "aircraft_bool"),
+                          stringsAsFactors = FALSE,
+                          correlation = 0,
+                          corr_direction = "text",
+                          corr_p_value = 0)
+j <- 1
+for (i in c(variables[-c(1,8)], "aircraft_bool")) {
+  cor_test_var <- cor.test(data_with_bool$distance, data_with_bool[[i]])
+  
+  corr_table$correlation[j] <- cor_test_var$estimate
+  if (cor_test_var$estimate < 0) {
+    corr_table$corr_direction[j] <- "negative"
+  } else if (cor_test_var$estimate > 0) {
+    corr_table$corr_direction[j] <- "positive"
+  } else {
+    corr_table$corr_direction[j] <- "neutral"
+  }
+  corr_table$correlation[j] <- cor_test_var$estimate
+  corr_table$corr_p_value[j] <- cor_test_var$p.value
+  j <- j + 1
+}
+
+corr_table %>% arrange(desc(abs(correlation))) %>% kable(caption = "Pairwise Correlation")
+```
+
+The scatter plots below visualize the correlation or the lack thereof.
+<br><br>
+```{r fig.height = 6, fig.width = 12}
+pairwise_viz <- list()
+for (i in variables[-c(8)]) {
+  if (i == "aircraft") {
+    pairwise_viz[[i]] <- data %>% ggplot(aes_string(i, "distance")) + 
+      geom_point(aes_string(col = i))
+  }
+  else {
+    pairwise_viz[[i]] <- data %>% ggplot(aes_string("distance", i)) + geom_point()
+  }
+}
+
+grid.arrange(pairwise_viz[[1]], pairwise_viz[[2]], pairwise_viz[[3]], pairwise_viz[[4]],
+             pairwise_viz[[5]], pairwise_viz[[6]], pairwise_viz[[7]],
+             nrow = 2, ncol = 4, top = "Pairwise correlation of each variable")
+```
+
+## univariate regression
+
+Each variable of the dataset is regressed individually against the target landing distance variable. The table below shows the coefficient and the significance of each. It appers that `speed_air`, `speed_ground`, `aircraft_bool`, `height` and `pitch` variables have a significant effect on the landing distance, when regressed individually.
+<br><br>
+```{r}
+uni_lm_table <- expand.grid(variable = c(variables[-c(1,8)], "aircraft_bool"),
+                            stringsAsFactors = FALSE,
+                            lm_coefficient = 0,
+                            lm_p_value = 0)
+j <- 1
+for (i in c(variables[-c(1,8)], "aircraft_bool")) {
+  lm_summary <- lm(data_with_bool$distance ~ data_with_bool[[i]]) %>% summary()
+  uni_lm_table$lm_coefficient[j] <- lm_summary$coefficients[2,1]
+  uni_lm_table$lm_p_value[j] <- lm_summary$coefficients[2,4]
+  j <- j + 1
+}
+
+uni_lm_table %>% arrange(lm_p_value) %>% kable(caption = "Coefficient table of linear model")
+```
+
+## standardized univariate regression
+
+The variables are standardized normally and the same steps are followed again. As expected, the same 5 variables are indicated to be significant.
+<br><br>
+```{r}
+data_standardized <- data_with_bool
+
+for (i in c(2:9)) {
+  data_standardized[i] <- (data_standardized[i] - mean(data_standardized[[i]], na.rm = TRUE)) /
+    var(data_standardized[[i]], na.rm = TRUE)^0.5
+}
+
+uni_lm_table_std <- expand.grid(variable = c(variables[-c(1,8)], "aircraft_bool"),
+                                stringsAsFactors = FALSE,
+                                std_coefficient = 0,
+                                std_p_value = 0)
+j <- 1
+for (i in c(variables[-c(1,8)], "aircraft_bool")) {
+  lm_summary <- lm(data_standardized$distance ~ data_standardized[[i]]) %>% summary()
+  uni_lm_table_std$std_coefficient[j] <- lm_summary$coefficients[2,1]
+  uni_lm_table_std$std_p_value[j] <- lm_summary$coefficients[2,4]
+  j <- j + 1
+}
+
+uni_lm_table_std %>% arrange(std_p_value) %>% 
+  kable(caption = "Coefficient table of standardized linear model")
+```
+
+A table combining the results of all three models is printed below. They are ordered in the increasing order of significance.
+<br><br>
+```{r}
+table0 <- corr_table %>% 
+  inner_join(uni_lm_table, by = "variable") %>% 
+  inner_join(uni_lm_table_std, by = "variable") %>% 
+  arrange(lm_p_value, std_p_value, corr_p_value)
+
+table0 %>% kable(caption = "Summary of all three analyses")
+```
+
+# multiple linear regression
+
+## multi collinearity
+
+It was observed earlier that `speed_air` and `speed_ground` were correlated. This will lead to multicollinearity when building a model to predict the landing distance. The effect is clearly visible in the below table where the coefficient of `speed_ground` changes direction and stops being significant. Thus is makes sense to keep only one of the variables in the final model.  
+
+And since `speed_air` variable has 642 `NA` rows, it's advisable to leave that out.
+<br><br>
+```{r}
+multi_col_table <- uni_lm_table %>% filter(variable %in% c("speed_air", "speed_ground"))
+multi_col_table <- rbind(multi_col_table, multi_col_table[1:2,])
+
+air_ground_model <- lm(distance ~ speed_air + speed_ground, data) %>% summary()
+
+multi_col_table$variable[4] <- "ground + air - air"
+multi_col_table$lm_coefficient[4] <- air_ground_model$coefficients["speed_air",1]
+multi_col_table$lm_p_value[4] <- air_ground_model$coefficients["speed_air",4]
+
+multi_col_table$variable[3] <- "ground + air - ground"
+multi_col_table$lm_coefficient[3] <- air_ground_model$coefficients["speed_ground",1]
+multi_col_table$lm_p_value[3] <- air_ground_model$coefficients["speed_ground",4]
+
+multi_col_table %>% kable(caption = "Effect of multi-collinearity on both speed variables")
+```
+
+## variable selection
+
+Now that the individual effect of the variables is established, multiple features can be used in the model to check for higher performance.
+<br><br>
+
+```{r}
+signif_vars <- table0 %>% filter(variable != "speed_air") %>% .$variable
+
+final_coef <- expand.grid(no_of_vars = 1:length(signif_vars),
+                          variables = "text", stringsAsFactors = FALSE,
+                          r_squared = 0,
+                          adj_r_squared = 0,
+                          aic = 0)
+
+for (i in 1:length(signif_vars)) {
+  vars_to_lm <- signif_vars[1:i]
+  lm_model <- lm(as.formula(paste("distance ~", paste(vars_to_lm, collapse = " + "))), 
+                 data_with_bool)
+  lm_summary <- lm_model %>% summary()
+  final_coef$variables[i] <- paste(vars_to_lm, collapse = " + ")
+  final_coef$r_squared[i] <- lm_summary$r.squared
+  final_coef$adj_r_squared[i] <-  lm_summary$adj.r.squared
+  final_coef$aic[i] <- lm_model %>% AIC()
+}
+
+final_coef %>% kable(caption = "Performance metrics of models with multiple variables")
+```
+
+The increase in the performance parameters with increase in number of variables is visualized below.
+<br><br>
+```{r fig.height = 8, fig.width = 4}
+grid.arrange(final_coef %>% ggplot(aes(no_of_vars, r_squared)) + geom_point() + geom_line(),
+             final_coef %>% ggplot(aes(no_of_vars, adj_r_squared)) + geom_point() + geom_line(),
+             final_coef %>% ggplot(aes(no_of_vars, aic)) + geom_point() + geom_line(), 
+             nrow = 3, ncol = 1, top = "Increasing performance with increasing number of response variables")
+```
+
+<br><br>
+When looking at the $R^2$ and $adj. R^2$, the performance plateaus at 3 while AIC reduces to the least value with 5 variables. Building the model with 5 variables would be optimal.
+<br><br>
+The model and the parameters are tabulated below.
+`r final_coef[5,] %>% kable()`
+
+## step-wise aic
+
+Since the function `stepAIC` expects data to be NA free, the `duration` variable is filtered.
+<br><br>
+```{r}
+data_na_rem <- na.omit(data_with_bool[,-c(1,5)])
+
+full_model <- lm(distance ~ . , data_na_rem)
+null_model <- lm(distance ~ 1 , data_na_rem)
+
+step_aic_model <- stepAIC(null_model, scope = list(lower = null_model, 
+                                                   upper = full_model),
+                          direction = "forward", 
+                          trace = 0) #disable the trace output
+```
+The best output, according to forward selection method from the above code is 
+<br>`distance ~ speed_ground + aircraft_bool + height`.
+<br><br>
+This is different from the model that we decided as optimal in the earlier steps manually. This can be attributed to the change in data that is passed to the stepAIC model. Removing the NA rows caused this difference. We can confirm this by rerunning the manual forward selection technique. The results are tablulated below in the table.
+<br><br>
+```{r}
+data_na_rem <- na.omit(data_with_bool[,-c(1,5)])
+
+for (i in 1:length(signif_vars)) {
+  vars_to_lm <- signif_vars[1:i]
+  lm_model <- lm(as.formula(paste("distance ~", paste(vars_to_lm, collapse = " + "))), 
+                 data_na_rem)
+  lm_summary <- lm_model %>% summary()
+  final_coef$variables[i] <- paste(vars_to_lm, collapse = " + ")
+  final_coef$aic[i] <- lm_model %>% AIC()
+}
+final_coef %>% dplyr::select(c("variables", "aic")) %>% 
+  kable(caption = "AIC plateaus at line three")
+```
+Now the model matches with the results of `stepAIC`, as it can be seen that the model `distance ~ speed_ground + aircraft_bool + height` has the best AIC.
+
+# introducing binary variables
+
+Two new variables `long_landing` and `risky_landing` are introduced into the dataset.
+They are binary, set to 1 if `distance > 2500` or `distance > 3000` respectively. The
+distributions of the new variables are shown below.
+```{r fig.height = 6, fig.width = 12}
+data_with_bool$long_landing <- as.factor(ifelse(data$distance > 2500, 1, 0))
+data_with_bool$risky_landing <- as.factor(ifelse(data$distance > 3000, 1, 0))
+
+histo_viz <- list()
+
+for (i in c("long_landing", "risky_landing")) {
+  histo_viz[[i]] <- data_with_bool %>% ggplot(aes_string(i, label = i)) + geom_bar() +
+    geom_text(stat = "count", aes(label = ..count..), vjust=-1)
+}
+
+grid.arrange(grobs = histo_viz, nrow = 1, ncol = 2, top = "Distribution of binary variables" )
+```
+
+# building logistic model for long_landing
+
+## univariate analysis
+
+Each variable of the dataset is regressed individually against the target binary variables. The tables below show the coefficient and the significance of each. It appers that `speed_air`, `speed_ground`, `aircraft_bool` and `pitch` variables have a significant effect on `long_landing`.
+<br><br>
+```{r}
+uni_glm_table_long <- expand.grid(variable = c(variables[-c(1,8)], "aircraft_bool"),
+                                  stringsAsFactors = FALSE,
+                                  glm_coefficient = 0,
+                                  glm_p_value = 0,
+                                  glm_direction = "a",
+                                  glm_odds = 0)
+j <- 1
+for (i in c(variables[-c(1,8)], "aircraft_bool")) {
+  set.seed(1804)
+  lm_summary <- glm(data_with_bool$long_landing ~ data_with_bool[[i]],
+                    family = binomial) %>% summary()
+  uni_glm_table_long$glm_coefficient[j] <- lm_summary$coefficients[2,1]
+  uni_glm_table_long$glm_p_value[j] <- lm_summary$coefficients[2,4]
+  uni_glm_table_long$glm_direction[j] <- ifelse(lm_summary$coefficients[2,1] > 0, 
+                                                "positive", "negative")
+  uni_glm_table_long$glm_odds[j] <- exp(lm_summary$coefficients[2,1])
+  j <- j + 1
+}
+
+uni_glm_table_long %>% arrange(glm_p_value) %>% mutate_if(is.numeric, round, 4) %>% 
+  kable(caption = "Coefficient table of LONG_LANDING, arranged by p-value")
+```
+
+## visualization
+
+For `long_landing`, the significant factors identified earlier are visualized and it's
+observed that the distribution is similar.
+```{r}
+long_signif_vars <- uni_glm_table_long %>% filter(glm_p_value < 0.05) %>% arrange(glm_p_value)
+
+association_viz <- list()
+
+for (i in long_signif_vars$variable) {
+  association_viz[[i]] <- data_with_bool %>% 
+    ggplot(aes_string(x = i, fill = "long_landing")) + 
+    geom_histogram(position = "dodge", binwidth = 1)
+}
+grid.arrange(grobs = association_viz, nrow = 2, ncol = 2, top = "Distrubution of binary variables")
+
+association_viz2 <- list()
+
+for (i in long_signif_vars$variable) {
+  association_viz2[[i]] <-  data_with_bool %>% ggplot(aes_string(i, "long_landing")) + 
+    geom_jitter(alpha = 0.8)
+}
+grid.arrange(grobs = association_viz2, nrow = 2, ncol = 2, top = "Association")
+```
+
+## modelling
+
+As established earlier in the multicollinearity section, `speed_air` and `speed_ground`
+are highly correlated and hence `speed_air` will not be used in the model. Thus
+the full model will be `long_landing ~ speed_ground, aircraft_bool, pitch`. The 
+coefficient table output is presented below.
+
+```{r}
+set.seed(1804)
+long_model <- glm(long_landing ~ speed_ground + pitch + aircraft_bool, 
+                  family = binomial, data_with_bool)
+
+long_aic <- summary(long_model) %>% .$aic 
+
+summary(long_model) %>% .$coefficients %>% as.data.frame() %>% 
+  rownames_to_column("Variable") %>% mutate_if(is.numeric, round, 4)  %>%
+  arrange(`Pr(>|z|)`) %>% kable()
+```
+
+## stepwise modelling
+
+To ensure the correct set of variables are chosen for the model, stepwise regression
+is performed with all the variables we have, with AIC to measure performance.
+```{r}
+set.seed(1804)
+data_na_rem <- na.omit(data_with_bool[,-c(1,5,8)])
+
+full_model <- glm(long_landing ~ ., 
+                  family = binomial, data_na_rem)
+null_model <- glm(long_landing ~ 1, 
+                  family = binomial, data_na_rem)
+
+step_aic_model <- step(null_model, scope = list(lower = null_model,
+                                                upper = full_model),
+                       direction = "forward",
+                       trace = 0) #disable the trace output
+```
+
+The model with best AIC has the formula `long_landing ~ speed_ground + aircraft_bool + height + pitch`. 
+This almost matches with significance test output except for the `height` variable.
+
+```{r}
+set.seed(1804)
+data_na_rem <- na.omit(data_with_bool[,-c(1,5,8)])
+
+full_model <- glm(long_landing ~ ., 
+                  family = binomial, data_na_rem)
+null_model <- glm(long_landing ~ 1, 
+                  family = binomial, data_na_rem)
+
+step_bic_model <- step(null_model, scope = list(lower = null_model, 
+                                                upper = full_model),
+                       direction = "forward", k = log(nrow(data_na_rem)),
+                       trace = 0) #disable the trace output
+```
+
+The model with best BIC has the formula `long_landing ~ speed_ground + aircraft_bool + height`, same as that we got for stepAIC.
+
+## summarizing
+
+<ul>
+<li>The factors affecting long_landing in the decreasing order are aircraft, 
+speed_ground and pitch </li>
+<li>The formula to calculate the odds of long_landing is </li>
+$-67.928 + 0.615 * speed ground + 3.044 * boeing + 1.066 * pitch$
+<li>Boeing flights have a higher chance of long_landing</li>
+<li>Number of passengers and duration seem to have the least effect</li>
+<li>The individual factor's effect on long_landing is presented in the table below.</li>
+</ul>
+
+```{r}
+uni_glm_table_long %>% arrange(desc(glm_coefficient)) %>% 
+  mutate_if(is.numeric, round, 4) %>% dplyr::select(c(1, 2, 4)) %>% kable()
+```
+
+# building logistic model for risky_landing
+
+## univariate analysis
+
+Each variable of the dataset is regressed individually against the target binary variables. The tables below show the coefficient and the significance of each. It appers that `speed_air` and `speed_ground` variables have a significant effect on `risky_landing`.
+<br><br>
+```{r}
+uni_glm_table_risky <- expand.grid(variable = c(variables[-c(1,8)], "aircraft_bool"),
+                                   stringsAsFactors = FALSE,
+                                   glm_coefficient = 0,
+                                   glm_p_value = 0,
+                                   glm_direction = "a",
+                                   glm_odds = 0)
+j <- 1
+for (i in c(variables[-c(1,8)], "aircraft_bool")) {
+  set.seed(1804)
+  lm_summary <- glm(data_with_bool$risky_landing ~ data_with_bool[[i]],
+                    family = binomial) %>% summary()
+  uni_glm_table_risky$glm_coefficient[j] <- lm_summary$coefficients[2,1]
+  uni_glm_table_risky$glm_p_value[j] <- lm_summary$coefficients[2,4]
+  uni_glm_table_risky$glm_direction[j] <- ifelse(lm_summary$coefficients[2,1] > 0, 
+                                                 "positive", "negative")
+  uni_glm_table_risky$glm_odds[j] <- exp(lm_summary$coefficients[2,1])
+  j <- j + 1
+}
+
+uni_glm_table_risky %>% arrange(glm_p_value) %>% mutate_if(is.numeric, round, 4) %>% 
+  kable(caption = "Coefficient table of risky_landing, arranged by p-value")
+```
+
+## visualization
+
+For `risky_landing`, the significant factors identified earlier are visualized and it's
+observed that the distribution is similar.
+```{r}
+long_signif_vars <- uni_glm_table_risky %>% filter(glm_p_value < 0.05) %>% arrange(glm_p_value)
+
+association_viz <- list()
+
+for (i in long_signif_vars$variable) {
+  association_viz[[i]] <- data_with_bool %>% 
+    ggplot(aes_string(x = i, fill = "risky_landing")) + 
+    geom_histogram(position = "dodge", binwidth = 1)
+}
+grid.arrange(grobs = association_viz, nrow = 2, ncol = 2, top = "Distrubution of binary variables" )
+
+association_viz2 <- list()
+
+for (i in long_signif_vars$variable) {
+  association_viz2[[i]] <-  data_with_bool %>% ggplot(aes_string(i, "risky_landing")) + 
+    geom_jitter(alpha = 0.8)
+}
+grid.arrange(grobs = association_viz2, nrow = 2, ncol = 2, top = "Association")
+```
+
+## modelling
+
+As established earlier in the multicollinearity section, `speed_air` and `speed_ground`
+are highly correlated and hence `speed_air` will not be used in the model. Thus
+the full model will be `risky_landing ~ speed_ground, aircraft_bool`. The 
+coefficient table output is presented below.
+
+```{r}
+set.seed(1804)
+risky_model <- glm(risky_landing ~ speed_ground + aircraft_bool, 
+                   family = binomial, data_with_bool)
+
+risky_aic <- summary(risky_model) %>% .$aic 
+
+summary(risky_model) %>% .$coefficients %>% as.data.frame() %>% 
+  rownames_to_column("Variable") %>% mutate_if(is.numeric, round, 4) %>%
+  arrange(`Pr(>|z|)`) %>% kable()
+```
+
+## stepwise modelling
+
+To ensure the correct set of variables are chosen for the model, stepwise regression
+is performed with all the variables we have, with AIC to measure performance.
+
+```{r}
+set.seed(1804)
+data_na_rem <- na.omit(data_with_bool[,-c(1,5,8)])
+
+full_model <- glm(risky_landing ~ ., 
+                  family = binomial, data_na_rem)
+null_model <- glm(risky_landing ~ 1, 
+                  family = binomial, data_na_rem)
+
+step_aic_model <- step(null_model, scope = list(lower = null_model, 
+                                                upper = full_model),
+                       direction = "forward", 
+                       trace = 0) #disable the trace output
+```
+
+The model with best AIC has the formula `risky_landing ~ speed_ground + aircraft_bool`. This 
+matches with significance test output.
+
+```{r}
+set.seed(1804)
+data_na_rem <- na.omit(data_with_bool[,-c(1,5,8)])
+
+full_model <- glm(risky_landing ~ ., 
+                  family = binomial, data_na_rem)
+null_model <- glm(risky_landing ~ 1, 
+                  family = binomial, data_na_rem)
+
+step_bic_model <- step(null_model, scope = list(lower = null_model, 
+                                                upper = full_model),
+                       direction = "forward", k = log(nrow(data_na_rem)),
+                       trace = 0) #disable the trace output
+```
+
+The model with best BIC has the formula `risky_landing ~ speed_ground + aircraft_bool`, same
+as AIC and the significance test parameters.
+
+## summarizing
+
+<ul>
+<li>The factors affecting risky_landing in the decreasing order are aircraft, 
+speed_ground </li>
+<li>The formula to calculate the odds of long_landing is </li>
+$-102.0772 + 0.9263 * speed ground + 4.0190 * boeing$
+<li>Boeing flights have a higher chance of risky_landing</li>
+<li>Number of passengers and duration seem to have the least effect</li>
+<li>The individual factor's effect on risky_landing is presented in the table below.</li>
+</ul>
+
+```{r}
+uni_glm_table_risky %>% arrange(desc(glm_coefficient)) %>% 
+  mutate_if(is.numeric, round, 4) %>% dplyr::select(c(1, 2, 4)) %>% kable()
+```
+
+# comparing the two models
+
+<ul>
+<li>`long_landing` was modeled with `speed_ground, aircraft_bool and pitch` while `risky_landing` was modeled with `speed_ground and aircraft_bool` </li>
+<li>The pitch of the model comes into picture while evaluating landing overrun, while the effect
+of pitch is not a significant factor that causes risky landing</li>
+<li>The AIC of `long_landing` model `r long_aic` while that of `risky_landing` is `r risky_aic`. This could indicate that we may have higer success of risky landing prediction </li>
+</ul>
+
+The ROC curves of both the models are plotted below and they follow a very similar pattern.
+
+```{r fig.height=6, fig.width=6}
+prediction(predict(long_model, type = "response"), data_with_bool$long_landing) %>%
+  performance("tpr", "fpr") %>%
+  plot(colorize = TRUE) 
+
+prediction(predict(risky_model, type = "response"), data_with_bool$risky_landing) %>%
+  performance("tpr", "fpr") %>%
+  plot(add = TRUE, colorize = TRUE) 
+```
+
+## predicting
+
+A commercial airplane is passing over the threshold of the runway, at this moment we have its basic information and measures of its airborne performance (Boeing, duration=200, no_pasg=80, speed_ground=115, speed_air=120, height=40, pitch=4). Predict its probability of being a long landing and a risky landing, respectively. Report the predicted probability as well as its 95% confidence interval.
+
+```{r}
+test_data <- data.frame(aircraft_bool = 1, duration = 200, no_pasg = 80, speed_ground = 115,
+                        speed_air = 120, height = 40, pitch = 4)
+
+long_prediction <- predict(long_model, test_data, type = "link", se.fit = TRUE)
+risky_prediction <- predict(risky_model, test_data, type = "link", se.fit = TRUE)
+
+long_prediction <- c(inv.logit(long_prediction$fit),
+                     inv.logit(long_prediction$fit - 1.96 * long_prediction$se.fit),
+                     inv.logit(long_prediction$fit + 1.96 * long_prediction$se.fit))
+risky_prediction <- c(inv.logit(risky_prediction$fit),
+                      inv.logit(risky_prediction$fit - 1.96 * risky_prediction$se.fit),
+                      inv.logit(risky_prediction$fit + 1.96 * risky_prediction$se.fit))
+```
+
+The predicted probability of `long_landing` is `r long_prediction[1]` and the 95% confidence
+interval is `r long_prediction [2]` and `r long_prediction[3]`.
+
+The predicted probability of `risky_landing` is `r risky_prediction[1]` and the 95% confidence
+interval is `r risky_prediction [2]` and `r risky_prediction[3]`.
+
+Looks like this plane is headed for trouble.
+
+# other link functions
+
+The last few steps of `risky_landing` are repeated with probit and complimentary 
+log-log logistic models. As expected, the probit and c log-log coefficients are
+about 1.6 ~ 1.8 times lower than logit.
+
+```{r}
+set.seed(1804)
+risky_model <- glm(risky_landing ~ speed_ground + aircraft_bool, 
+                   family = binomial, data_with_bool)
+
+logit_coef <- summary(risky_model) %>% .$coefficients %>% as.data.frame() %>% 
+  rownames_to_column("Variable") %>% mutate_if(is.numeric, round, 4) %>%
+  arrange(`Pr(>|z|)`)
+
+set.seed(1804)
+prob_risky_model <- glm(risky_landing ~ speed_ground + aircraft_bool, 
+                        family = binomial(link = "probit"), data_with_bool)
+
+prob_coef <- summary(prob_risky_model) %>% .$coefficients %>% as.data.frame() %>% 
+  rownames_to_column("Variable") %>% mutate_if(is.numeric, round, 4) %>%
+  arrange(`Pr(>|z|)`) 
+
+set.seed(1804)
+clog_risky_model <- glm(risky_landing ~ speed_ground + aircraft_bool, 
+                        family = binomial(link = "cloglog"), data_with_bool)
+
+clog_coef <- summary(clog_risky_model) %>% .$coefficients %>% as.data.frame() %>% 
+  rownames_to_column("Variable") %>% mutate_if(is.numeric, round, 4) %>%
+  arrange(`Pr(>|z|)`)
+
+bind_rows(logit_coef %>% mutate(Link = "Logit"),
+          prob_coef %>% mutate(Link = "Probit"),
+          clog_coef %>% mutate(Link = "C Log-Log")) %>% 
+  dplyr::select(c(6, 1:5)) %>% kable(caption = "Coefficients compared")
+```
+
+Plotting the ROC curves for all three models, it's observed that they follow an
+extremely similar path.
+
+```{r fig.height=6, fig.width=6}
+prediction(predict(risky_model, type = "response"), data_with_bool$risky_landing) %>%
+  performance("tpr", "fpr") %>%
+  plot(colorize = TRUE) 
+
+prediction(predict(prob_risky_model, type = "response"), data_with_bool$risky_landing) %>%
+  performance("tpr", "fpr") %>%
+  plot(add = TRUE, colorize = TRUE) 
+
+prediction(predict(clog_risky_model, type = "response"), data_with_bool$risky_landing) %>%
+  performance("tpr", "fpr") %>%
+  plot(add = TRUE, colorize = TRUE) 
+```
+
+## predicting on training data
+
+The top 5 flights predicted to `risky_landing` are printed below for each model.
+
+```{r}
+top_5_risk <- bind_cols(predict(risky_model, type = "response") %>% as.data.frame() %>% 
+                          rownames_to_column("Logit") %>% dplyr::arrange(desc(`.`)) %>%  
+                          dplyr::select(1) %>% head(5),
+                        predict(prob_risky_model, type = "response") %>% as.data.frame() %>% 
+                          rownames_to_column("Probit") %>% dplyr::arrange(desc(`.`)) %>%  
+                          dplyr::select(1) %>% head(5),
+                        predict(clog_risky_model, type = "response") %>% as.data.frame() %>% 
+                          rownames_to_column("C Log Log") %>% dplyr::arrange(desc(`.`)) %>%  
+                          dplyr::select(1) %>% head(5))
+
+top_5_risk %>% kable(caption = "Indices of top 5 flights at risk")
+```
+
+Matching the index we identify ten unique flights out of the 15 predicted by the three models.
+All three models predict Boeing flights to be at higher risk than Airbus flights.  
+
+```{r}
+data_with_bool[top_5_risk %>% as.matrix(),] %>%
+  filter(!duplicated(data_with_bool[top_5_risk %>% as.matrix(),])) %>% 
+  kable(caption = "Flights that have high probability of risky landing")
+```
+
+## predicting
+
+The three models are applied on the new line of data that we  saw earlier and the 
+probabilities are compared.
+
+```{r}
+risky_prediction <- predict(risky_model, test_data, type = "link", se.fit = TRUE)
+probit_prediction <- predict(prob_risky_model, test_data, type = "link", se.fit = TRUE)
+clog_prediction <- predict(clog_risky_model, test_data, type = "link", se.fit = TRUE)
+
+risky_prediction <- c(inv.logit(risky_prediction$fit),
+                      inv.logit(risky_prediction$fit - 1.96 * risky_prediction$se.fit),
+                      inv.logit(risky_prediction$fit + 1.96 * risky_prediction$se.fit))
+probit_prediction <- c(inv.logit(probit_prediction$fit),
+                       inv.logit(probit_prediction$fit - 1.96 * probit_prediction$se.fit),
+                       inv.logit(probit_prediction$fit + 1.96 * probit_prediction$se.fit))
+clog_prediction <- c(inv.logit(clog_prediction$fit),
+                     inv.logit(clog_prediction$fit - 1.96 * clog_prediction$se.fit),
+                     inv.logit(clog_prediction$fit + 1.96 * clog_prediction$se.fit))
+
+data.frame(model = c("Probability", "Left Interval", "Right Interval"),
+           logit = risky_prediction,
+           probit = probit_prediction,
+           clog = clog_prediction) %>% kable()
+```
+
+It is observed that the standard errors of probit and complementary log-log is much higher,
+causing the probability to fluctuate much more than logit does.
+
+# multinomial regression
+
+A multinomial variable `Y` is created and attached to the dataset.
+
+Y = 1 if distance < 1000  
+Y = 2 if 1000 < = distance < 2500  
+Y = 3 otherwise  
+
+The distribution of the new variable is visualized in the histogram below.
+
+```{r}
+data <- na.omit(data_with_bool[, -c(1, 5, 10, 11)])
+data$y <- as.factor(ifelse(data$distance < 1000, 1,
+                           ifelse(data$distance < 2500, 2, 3)))
+data <- data[, -6]
+data$y <- factor(data$y, levels = c(3, 2, 1))
+
+data %>% ggplot(aes(y, label = y)) + geom_bar(aes(fill = y)) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = 2)
+```
+
+## visualizing
+
+Visible in below graph is that, the proportion of y is significantly different in
+`aircraft_bool` and `speed_ground`. A slighter pattern is observable in case of `height`
+and `pitch` but none for `duration` and `no_pasg`.
+
+```{r fig.height=6, fig.width=6}
+viz <- list()
+viz[[1]] <- data %>% group_by(aircraft_bool, y) %>% summarize(count = n()) %>% 
+  ggplot(aes(as.factor(aircraft_bool))) + geom_col(aes(y = count, fill = y)) +
+  theme(axis.title.x = element_blank())
+
+viz[[2]] <- data %>% arrange(y) %>% ggplot(aes(1:nrow(data), speed_ground)) + 
+  geom_line(aes(col = y), show.legend = FALSE) + theme(axis.title.x = element_blank(),
+                                                       axis.text.x = element_blank(),
+                                                       axis.ticks.x = element_blank())
+viz[[3]] <- data %>% arrange(y) %>% ggplot(aes(1:nrow(data), duration)) + 
+  geom_line(aes(col = y), show.legend = FALSE) + theme(axis.title.x = element_blank(),
+                                                       axis.text.x = element_blank(),
+                                                       axis.ticks.x = element_blank())
+viz[[4]] <- data %>% arrange(y) %>% ggplot(aes(1:nrow(data), no_pasg)) + 
+  geom_line(aes(col = y), show.legend = FALSE) + theme(axis.title.x = element_blank(),
+                                                       axis.text.x = element_blank(),
+                                                       axis.ticks.x = element_blank())
+viz[[5]] <- data %>% arrange(y) %>% ggplot(aes(1:nrow(data), height)) + 
+  geom_line(aes(col = y), show.legend = FALSE) + theme(axis.title.x = element_blank(),
+                                                       axis.text.x = element_blank(),
+                                                       axis.ticks.x = element_blank())
+viz[[6]] <- data %>% arrange(y) %>% ggplot(aes(1:nrow(data), pitch)) + 
+  geom_line(aes(col = y), show.legend = FALSE) + theme(axis.title.x = element_blank(),
+                                                       axis.text.x = element_blank(),
+                                                       axis.ticks.x = element_blank())
+grid.arrange(grobs = viz, nrow = 3, ncol = 2, 
+             top = "Relationship between each variable against y" )
+```
+
+## model selection
+
+Stepwise regression is performed to get the model with the lowest AIC. Direction is set to both.
+
+```{r results= FALSE}
+set.seed(1804)
+
+full_model <- multinom(y ~ . , data)
+null_model <- multinom(y ~ 1 , data)
+
+step_aic_model <- stepAIC(null_model, scope = list(lower = null_model, 
+                                                   upper = full_model),
+                          direction = "both", 
+                          trace = 0) #disable the trace output
+# as.formula(step_aic_model$call[[2]])
+```
+
+The model `y ~ speed_ground + aircraft_bool + height + pitch` is chosen as the 
+best model and this corroborates with our inference from the visualization earlier.
+The summary of the model is printed below.
+
+```{r results=FALSE}
+model_summary <- multinom(as.formula(step_aic_model$call[[2]]), data) %>% 
+  summary() %>% .$coefficients %>% as_data_frame() %>% mutate(y = c("y = 2", "y = 1")) %>% 
+  dplyr::select(6, 1:5) 
+```
+```{r}
+model_summary %>% kable(caption = "Intercepts for two of the multinomial variables")
+```
+
+## summarizing
+
+<ul>
+<li>31.65% of the flights have a landing distance less than 1000, 55.44% have distance
+between 1000 and 2500 while the remaining 12.91% exceeded 2500.</li>
+<li>The most significant factors affecting the the flights' distance bucket are
+speed_ground and make of aircraft.</li>
+<li>Height and Pitch have a lesser, but statistically significant effect on the bucket.</li>
+<li>The odds of a flight falling into either bucket 1 or 2 can be calculated from the
+coefficient table, as a function of the four variables mentioned above.</li>
+<li>The odds can then be converted to actual probability, which will  help to
+figure out the odds of the flight being in bucket 3.</li>
+</ul>
+
+# modelling number of passengers
+
+Clearly evident, the distribution of number of passengers is normal. But since the
+number cannot be negative, a log-normal distribution would be a better fit.
+
+```{r fig.width=8, fig.height=4}
+data_with_bool <- data_with_bool2[, -c(1)]
+
+grid.arrange(data_with_bool %>% ggplot(aes(no_pasg)) + geom_histogram(),
+             ggplot(data_with_bool, aes(sample = no_pasg)) +
+               geom_qq(alpha = 0.3) +   geom_qq_line(linetype = "dashed", color = "red2"),
+             ncol = 2, nrow = 1)
+```
+The mean and standard deviation in our dataset is `r mean(data_with_bool$no_pasg)` and
+`r sd(data_with_bool$no_pasg)`.
+
+The other variables of the dataset is correlated against `no_pasg` to test if they
+could be predicted. But none of the correleation is high enough/ significant enough
+suggesting that `no_pasg` is a independant variable.
+
+```{r}
+corr_table <- expand.grid(variable = colnames(data_with_bool[-2]),
+                          stringsAsFactors = FALSE,
+                          correlation = 0,
+                          corr_direction = "text",
+                          corr_p_value = 0)
+j <- 1
+for (i in colnames(data_with_bool[-2])) {
+  cor_test_var <- cor.test(data_with_bool$no_pasg, data_with_bool[[i]])
+  
+  corr_table$correlation[j] <- cor_test_var$estimate
+  if (cor_test_var$estimate < 0) {
+    corr_table$corr_direction[j] <- "negative"
+  } else if (cor_test_var$estimate > 0) {
+    corr_table$corr_direction[j] <- "positive"
+  } else {
+    corr_table$corr_direction[j] <- "neutral"
+  }
+  corr_table$correlation[j] <- cor_test_var$estimate
+  corr_table$corr_p_value[j] <- cor_test_var$p.value
+  j <- j + 1
+}
+
+corr_table %>% arrange(desc(abs(corr_p_value))) %>% kable(caption = "Pairwise Correlation")
+```
